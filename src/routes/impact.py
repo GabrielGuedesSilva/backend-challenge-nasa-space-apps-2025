@@ -14,11 +14,10 @@ LAND_COVER_IDENTIFY = (
     'GAP_Land_Cover_NVC_Formation_Landuse/MapServer/identify'
 )
 UA = {'User-Agent': 'meteor-madness-context/1.4 (+spaceapps)'}
+FCC_URL = 'https://geo.fcc.gov/api/census/block/find'
+CENSUS_URL = 'https://api.census.gov/data/2020/dec/pl'
 
 
-# ------------------------------
-# Funções auxiliares
-# ------------------------------
 def elevation_epqs(lat: float, lon: float) -> float | None:
     for url in [EPQS_URL, 'https://elevation.nationalmap.gov/epqs/v1/json']:
         try:
@@ -42,33 +41,80 @@ def elevation_epqs(lat: float, lon: float) -> float | None:
     return None
 
 
+def calcular_efeitos_geologicos(
+    energy_megatons_tnt: float, crater_diameter_km: float, ocean_impact=False
+):
+    E_J = energy_megatons_tnt * 4.184e15
+
+    eta_values = [1e-6, 1e-5, 1e-4]
+    magnitudes = []
+    for eta in eta_values:
+        E_seismic = eta * E_J
+        mag = (math.log10(E_seismic) - 4.8) / 1.5
+        magnitudes.append(round(mag, 2))
+
+    tsunami_risk = 'none'
+    if ocean_impact:
+        if E_J > 1e18:
+            tsunami_risk = 'regional'
+        elif E_J > 1e17:
+            tsunami_risk = 'local'
+
+    mag_max = max(magnitudes)
+    felt_radius_km = 0
+    if mag_max >= 7:
+        felt_radius_km = 1000
+    elif mag_max >= 6:
+        felt_radius_km = 500
+    elif mag_max >= 5:
+        felt_radius_km = 200
+    elif mag_max >= 4:
+        felt_radius_km = 50
+    else:
+        felt_radius_km = 10
+
+    return {
+        'energy_joules': E_J,
+        'magnitude_estimate_range': magnitudes,
+        'tsunami_risk': tsunami_risk,
+        'felt_radius_km_est': felt_radius_km,
+        'crater_radius_km': round(crater_diameter_km / 2, 2),
+    }
+
+
 def population_at_point(lat: float, lon: float) -> int:
     try:
-        fcc_url = 'https://geo.fcc.gov/api/census/block/find'
-        fcc_params = {
-            'latitude': lat,
-            'longitude': lon,
-            'format': 'json',
-            'showall': 'true',
-        }
-        fr = requests.get(fcc_url, params=fcc_params, headers=UA, timeout=10)
+        fr = requests.get(
+            FCC_URL,
+            params={
+                'latitude': lat,
+                'longitude': lon,
+                'format': 'json',
+                'showall': 'true',
+            },
+            headers=UA,
+            timeout=10,
+        )
         fjs = fr.json()
         fips_blk = fjs.get('Block', {}).get('FIPS')
         if not fips_blk or len(fips_blk) != 15:
             return 0
-        state, county, tract, block = (
-            fips_blk[0:2],
-            fips_blk[2:5],
-            fips_blk[5:11],
-            fips_blk[11:15],
+
+        state = fips_blk[0:2]
+        county = fips_blk[2:5]
+        tract = fips_blk[5:11]
+        block = fips_blk[11:15]
+
+        cr = requests.get(
+            CENSUS_URL,
+            params={
+                'get': 'P1_001N',
+                'for': f'block:{block}',
+                'in': f'state:{state}+county:{county}+tract:{tract}',
+            },
+            headers=UA,
+            timeout=10,
         )
-        cen_url = 'https://api.census.gov/data/2020/dec/pl'
-        cen_params = {
-            'get': 'P1_001N',
-            'for': f'block:{block}',
-            'in': f'state:{state} county:{county} tract:{tract}',
-        }
-        cr = requests.get(cen_url, params=cen_params, headers=UA, timeout=10)
         rows = cr.json()
         if len(rows) >= 2:
             return int(rows[1][0])
@@ -122,14 +168,102 @@ class ImpactInput(BaseModel):
     lon: float
 
 
-# ------------------------------
-# Classe principal
-# ------------------------------
 class ImpactRouter:
     def __init__(self, container):
         self.router = APIRouter(prefix='/impact', tags=['impact'])
 
-        # === ROTA 1 ===
+        @self.router.get('/population')
+        async def get_population(
+            lat: float | None = Query(None),
+            lon: float | None = Query(None),
+            state: str | None = Query(None),
+        ):
+            """
+            Retorna população aproximada.
+            - Se passar `lat` e `lon`, retorna população do bloco.
+            - Se passar `state` (código FIPS do estado, ex: 47), retorna população do estado.
+            """
+            async with httpx.AsyncClient() as client:
+                try:
+                    if state:
+                        # Consulta população do estado
+                        census_resp = await client.get(
+                            CENSUS_URL,
+                            headers=UA,
+                            params={
+                                'get': 'P1_001N,NAME',
+                                'for': f'state:{state}',
+                            },
+                            timeout=10,
+                        )
+                        census_resp.raise_for_status()
+                        data = census_resp.json()
+                        population = int(data[1][0])
+                        state_name = data[1][1]
+                        return {
+                            'state': state_name,
+                            'state_fips': state,
+                            'population': population,
+                        }
+
+                    elif lat is not None and lon is not None:
+                        # Consulta população do bloco (latitude/longitude)
+                        fcc_resp = await client.get(
+                            FCC_URL,
+                            headers=UA,
+                            params={
+                                'latitude': lat,
+                                'longitude': lon,
+                                'format': 'json',
+                                'showall': 'true',
+                            },
+                            timeout=10,
+                        )
+                        fcc_resp.raise_for_status()
+                        fcc_data = fcc_resp.json()
+                        fips = fcc_data['Block']['FIPS']
+
+                        state_code = fips[:2]
+                        county = fips[2:5]
+                        tract = fips[5:11]
+                        block = fips[11:]
+
+                        census_resp = await client.get(
+                            CENSUS_URL,
+                            headers=UA,
+                            params={
+                                'get': 'P1_001N',
+                                'for': f'block:{block}',
+                                'in': f'state:{state_code}+county:{county}+tract:{tract}',
+                            },
+                            timeout=10,
+                        )
+                        census_resp.raise_for_status()
+                        census_data = census_resp.json()
+                        population = int(census_data[1][0])
+                        return {
+                            'lat': lat,
+                            'lon': lon,
+                            'population': population,
+                        }
+
+                    else:
+                        raise HTTPException(
+                            status_code=HTTPStatus.BAD_REQUEST,
+                            detail='É necessário informar lat/lon ou state.',
+                        )
+
+                except httpx.HTTPStatusError as e:
+                    return {
+                        'error': f'HTTP error: {e.response.status_code}',
+                        'details': str(e),
+                    }
+                except Exception as e:
+                    return {
+                        'error': 'Failed to fetch population',
+                        'details': str(e),
+                    }
+
         @self.router.get('/simulate/{asteroid_id}', status_code=HTTPStatus.OK)
         async def simulate_impact(
             request: Request,
@@ -137,7 +271,6 @@ class ImpactRouter:
             lat: float = Query(...),
             lon: float = Query(...),
         ):
-            # Dados do asteroide
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f'{NASA_BASE_URL_NEO}/{asteroid_id}?api_key={NASA_API_KEY}'
@@ -157,19 +290,16 @@ class ImpactRouter:
                 ]
             )
 
-            # Física
             rho_i, rho_t = 3000, 2500
             mass, energy_mt, crater_km = calcular_impacto(
                 diameter_m, velocity_kms, rho_i, rho_t
             )
-            crater_radius_m = (crater_km * 1000) / 2  # raio em metros
+            crater_radius_m = (crater_km * 1000) / 2
 
-            # Contexto do local
             elevation_epqs(lat, lon)
             pop_block = population_at_point(lat, lon)
             bld = building_count_overpass(lat, lon, radius_m=crater_radius_m)
 
-            # Estimar população afetada
             crater_radius_km = crater_km / 2
             pop_est = (
                 int(pop_block * (math.pi * (crater_radius_km**2) / 0.01))
@@ -189,24 +319,20 @@ class ImpactRouter:
                 },
             }
 
-        # === ROTA 2 ===
         @self.router.post('/custom', status_code=HTTPStatus.OK)
         async def simulate_custom(request: Request, data: ImpactInput):
-            # Física
             rho_t = 2500
             mass, energy_mt, crater_km = calcular_impacto(
                 data.diameter_m, data.velocity_kms, data.density_kg_m3, rho_t
             )
             crater_radius_m = (crater_km * 1000) / 2
 
-            # Contexto
             elevation_epqs(data.lat, data.lon)
             pop_block = population_at_point(data.lat, data.lon)
             bld = building_count_overpass(
                 data.lat, data.lon, radius_m=crater_radius_m
             )
 
-            # Estimar população afetada
             crater_radius_km = crater_km / 2
             pop_est = (
                 int(pop_block * (math.pi * (crater_radius_km**2) / 0.01))
@@ -225,3 +351,16 @@ class ImpactRouter:
                     'buildings_count': bld,
                 },
             }
+
+        @self.router.post('/geological-effects', status_code=HTTPStatus.OK)
+        async def geological_effects_endpoint(
+            request: Request, data: ImpactInput
+        ):
+            rho_t = 2500
+            mass, energy_mt, crater_km = calcular_impacto(
+                data.diameter_m, data.velocity_kms, data.density_kg_m3, rho_t
+            )
+            efeitos = calcular_efeitos_geologicos(
+                energy_mt, crater_km, ocean_impact=False
+            )
+            return efeitos
