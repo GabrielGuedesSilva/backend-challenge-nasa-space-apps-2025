@@ -27,7 +27,7 @@ def register_routers(app: FastAPI, container):
 
 def create_app(database_url=settings.DATABASE_URL) -> FastAPI:
     app = FastAPI(
-        title='Meu App',
+        title='Api Challenge Nasa Space Apps 2025',
         description='Documentação da API',
         version='1.0.0',
         lifespan=lifespan,
