@@ -1,5 +1,6 @@
 import math
 from http import HTTPStatus
+from typing import Optional
 
 import httpx
 import requests
@@ -16,6 +17,104 @@ LAND_COVER_IDENTIFY = (
 UA = {'User-Agent': 'meteor-madness-context/1.4 (+spaceapps)'}
 FCC_URL = 'https://geo.fcc.gov/api/census/block/find'
 CENSUS_URL = 'https://api.census.gov/data/2020/dec/pl'
+
+# Constantes
+# =========================
+G = 6.67430e-11  # grav. universal (m^3 kg^-1 s^-2)
+R_EARTH = 6_371_000.0  # raio da Terra (m)
+V_ESC = 11.2  # km/s (escape da Terra na superfície)
+TNT_J = 4.184e15  # J por megaton de TNT
+
+
+# =========================
+# Funções auxiliares (cópia do seu código)
+# =========================
+def asteroid_mass_kg(diameter_m: float, density_kg_m3: float) -> float:
+    r = diameter_m / 2.0
+    volume = (4.0 / 3.0) * math.pi * (r**3)
+    return density_kg_m3 * volume
+
+
+def infer_vinf_kms(v_impact_kms: float) -> float:
+    x = v_impact_kms**2 - V_ESC**2
+    if x <= 0.1:
+        return 0.316
+    return math.sqrt(x)
+
+
+def miss_distance_required_m(v_inf_kms: float, k_margin: float) -> float:
+    if v_inf_kms <= 0:
+        v_inf_kms = 0.316
+    return k_margin * R_EARTH * math.sqrt(1.0 + (V_ESC / v_inf_kms) ** 2)
+
+
+def dv_required_mps(B_req_m: float, lead_time_seconds: float) -> float:
+    return B_req_m / max(lead_time_seconds, 1.0)
+
+
+def kinetic_equivalence(
+    m_ast_kg: float,
+    dv_req_mps: float,
+    impactor_speed_kms: float = 7.0,
+    beta: float = 2.5,
+    impactor_mass_fixed_kg: float = 600.0,
+) -> dict:
+    v_i_mps = impactor_speed_kms * 1000.0
+    dv_per_impactor = (beta * impactor_mass_fixed_kg * v_i_mps) / m_ast_kg
+    m_imp_needed = (dv_req_mps * m_ast_kg) / (beta * v_i_mps)
+    N_needed = math.ceil(max(dv_req_mps, 1e-12) / max(dv_per_impactor, 1e-12))
+    return {
+        'impactor_speed_kms': impactor_speed_kms,
+        'beta': beta,
+        'impactor_mass_fixed_kg': impactor_mass_fixed_kg,
+        'delta_v_per_impactor_mps': dv_per_impactor,
+        'impactor_mass_needed_kg': m_imp_needed,
+        'impactors_needed_for_req': int(N_needed),
+    }
+
+
+def gravity_tractor_equivalence(
+    dv_req_mps: float,
+    lead_time_seconds: float,
+    asteroid_radius_m: float,
+    hover_radius_factor: float = 2.0,
+    spacecraft_mass_fixed_kg: Optional[float] = None,
+) -> dict:
+    r = hover_radius_factor * asteroid_radius_m
+    m_sc_needed = (dv_req_mps * (r**2)) / (G * max(lead_time_seconds, 1.0))
+    out = {
+        'hover_radius_factor': hover_radius_factor,
+        'spacecraft_mass_needed_kg': m_sc_needed,
+    }
+    if spacecraft_mass_fixed_kg is not None:
+        dv_with_fixed = (
+            G * spacecraft_mass_fixed_kg * lead_time_seconds
+        ) / r**2
+        out['spacecraft_mass_fixed_kg'] = spacecraft_mass_fixed_kg
+        out['delta_v_with_fixed_mps'] = dv_with_fixed
+        out['meets_requirement'] = dv_with_fixed >= dv_req_mps
+    return out
+
+
+def nuclear_equivalence_Cm(
+    m_ast_kg: float,
+    asteroid_radius_m: float,
+    dv_req_mps: float,
+    standoff_R_factor: float = 1.5,
+    Cm_Ns_per_J: float = 1e-4,
+    f_coupling: float = 0.2,
+) -> dict:
+    R = standoff_R_factor * asteroid_radius_m
+    numerator = dv_req_mps * 4.0 * (R**2) * m_ast_kg
+    denom = max(Cm_Ns_per_J * f_coupling * (asteroid_radius_m**2), 1e-20)
+    E_needed_J = numerator / denom
+    yield_mt = E_needed_J / TNT_J
+    return {
+        'standoff_R_factor': standoff_R_factor,
+        'Cm_Ns_per_J': Cm_Ns_per_J,
+        'f_coupling': f_coupling,
+        'yield_required_megatons': yield_mt,
+    }
 
 
 def elevation_epqs(lat: float, lon: float) -> float | None:
@@ -195,11 +294,6 @@ class ImpactRouter:
             lon: float | None = Query(None),
             state: str | None = Query(None),
         ):
-            """
-            Retorna população aproximada.
-            - Se passar `lat` e `lon`, retorna população do bloco.
-            - Se passar `state` (código FIPS do estado, ex: 47), retorna população do estado.
-            """
             async with httpx.AsyncClient() as client:
                 try:
                     if state:
@@ -391,3 +485,40 @@ class ImpactRouter:
                 energy_mt, crater_km, ocean_impact=False
             )
             return efeitos
+
+        @self.router.post('/{year}', status_code=HTTPStatus.OK)
+        def calculate_mitigation(data: ImpactInput, year: str):
+            """
+            Calcula mitigação do impacto do asteroide com base no tempo disponível (`year`).
+            """
+            # Massa do asteroide
+            m_ast = asteroid_mass_kg(data.diameter_m, data.density_kg_m3)
+            R_ast = data.diameter_m / 2.0
+            v_inf = infer_vinf_kms(data.velocity_kms)
+
+            # Distância mínima necessária para evitar impacto
+            B_req = miss_distance_required_m(v_inf, k_margin=1.5)
+
+            # Lead time em segundos a partir do parâmetro 'year'
+            lead_time_seconds = float(year) * 365.25 * 24 * 3600
+
+            # Delta-v necessário
+            dv_req = dv_required_mps(B_req, lead_time_seconds)
+
+            result = {
+                'lead_time_years': year,
+                'delta_v_required_mps': dv_req,
+                'kinetic': kinetic_equivalence(
+                    m_ast_kg=m_ast, dv_req_mps=dv_req
+                ),
+                'gravity_tractor': gravity_tractor_equivalence(
+                    dv_req_mps=dv_req,
+                    lead_time_seconds=lead_time_seconds,
+                    asteroid_radius_m=R_ast,
+                    spacecraft_mass_fixed_kg=20000.0,  # exemplo fixo
+                ),
+                'nuclear': nuclear_equivalence_Cm(
+                    m_ast_kg=m_ast, asteroid_radius_m=R_ast, dv_req_mps=dv_req
+                )
+            }
+            return result
