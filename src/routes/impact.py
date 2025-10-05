@@ -41,6 +41,23 @@ def elevation_epqs(lat: float, lon: float) -> float | None:
     return None
 
 
+def calcular_profundidade_cratera(
+    crater_diameter_km: float, elevation_m
+) -> float:
+    try:
+        elevation_m = float(elevation_m)
+    except (TypeError, ValueError):
+        elevation_m = 0.0
+
+    base_depth_km = (
+        0.2 * crater_diameter_km
+        if crater_diameter_km < 3
+        else 0.1 * crater_diameter_km
+    )
+    correction_factor = max(0.5, 1 - (elevation_m / 10000))
+    return base_depth_km * correction_factor
+
+
 def calcular_efeitos_geologicos(
     energy_megatons_tnt: float, crater_diameter_km: float, ocean_impact=False
 ):
@@ -264,6 +281,7 @@ class ImpactRouter:
                         'details': str(e),
                     }
 
+        # Dentro da rota /simulate/{asteroid_id}
         @self.router.get('/simulate/{asteroid_id}', status_code=HTTPStatus.OK)
         async def simulate_impact(
             request: Request,
@@ -296,7 +314,7 @@ class ImpactRouter:
             )
             crater_radius_m = (crater_km * 1000) / 2
 
-            elevation_epqs(lat, lon)
+            elev_m = elevation_epqs(lat, lon)
             pop_block = population_at_point(lat, lon)
             bld = building_count_overpass(lat, lon, radius_m=crater_radius_m)
 
@@ -307,18 +325,23 @@ class ImpactRouter:
                 else 0
             )
 
+            crater_depth_km = calcular_profundidade_cratera(crater_km, elev_m)
+
             return {
                 'velocity_kms': round(velocity_kms, 2),
                 'mass_kg': mass,
                 'energy_megatons_tnt': round(energy_mt, 2),
                 'crater_diameter_km': round(crater_km, 2),
+                'crater_depth_km': crater_depth_km,
                 'context': {
+                    'elevation_m': elev_m,
                     'population_estimated_affected': pop_est,
                     'buildings_within_m': round(crater_radius_m, 2),
                     'buildings_count': bld,
                 },
             }
 
+        # Dentro da rota /custom
         @self.router.post('/custom', status_code=HTTPStatus.OK)
         async def simulate_custom(request: Request, data: ImpactInput):
             rho_t = 2500
@@ -327,7 +350,7 @@ class ImpactRouter:
             )
             crater_radius_m = (crater_km * 1000) / 2
 
-            elevation_epqs(data.lat, data.lon)
+            elev_m = elevation_epqs(data.lat, data.lon)
             pop_block = population_at_point(data.lat, data.lon)
             bld = building_count_overpass(
                 data.lat, data.lon, radius_m=crater_radius_m
@@ -340,12 +363,16 @@ class ImpactRouter:
                 else 0
             )
 
+            crater_depth_km = calcular_profundidade_cratera(crater_km, elev_m)
+
             return {
                 'velocity_kms': round(data.velocity_kms, 2),
                 'mass_kg': mass,
                 'energy_megatons_tnt': round(energy_mt, 2),
                 'crater_diameter_km': round(crater_km, 2),
+                'crater_depth_km': crater_depth_km,
                 'context': {
+                    'elevation_m': elev_m,
                     'population_estimated_affected': pop_est,
                     'buildings_within_m': round(crater_radius_m, 2),
                     'buildings_count': bld,
