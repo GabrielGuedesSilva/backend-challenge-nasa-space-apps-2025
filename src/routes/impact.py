@@ -3,6 +3,7 @@ from http import HTTPStatus
 from typing import Optional
 
 import httpx
+import numpy as np
 import requests
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -24,6 +25,100 @@ G = 6.67430e-11  # grav. universal (m^3 kg^-1 s^-2)
 R_EARTH = 6_371_000.0  # raio da Terra (m)
 V_ESC = 11.2  # km/s (escape da Terra na superfície)
 TNT_J = 4.184e15  # J por megaton de TNT
+
+
+def elevation_epqs(lat: float, lon: float) -> float | None:
+    """Obtém elevação do ponto via USGS EPQS"""
+    try:
+        r = requests.get(
+            EPQS_URL,
+            params={'x': lon, 'y': lat, 'units': 'Meters'},
+            headers=UA,
+            timeout=10,
+        )
+        if r.status_code == 200:
+            js = r.json()
+            return (
+                js.get('value')
+                or js.get('Elevation')
+                or js.get('USGS_Elevation_Point_Query_Service', {})
+                .get('Elevation_Query', {})
+                .get('Elevation')
+            )
+    except Exception:
+        pass
+    return None
+
+
+def is_near_coast(lat: float, lon: float) -> bool:
+    """
+    Determina de forma simples se o ponto está no mar ou perto da costa:
+    - Se elevação < 0 → oceano
+    - Se elevação entre 0 e 20 m → região costeira potencial
+    """
+    elev = elevation_epqs(lat, lon)
+    if elev is None:
+        return False
+    elev = float(elev)
+    return elev < 20  # oceano ou região costeira baixa
+
+
+def tsunami_wave_height(energy_megatons: float) -> float:
+    """
+    Estima altura inicial do tsunami em metros baseada na energia do impacto.
+    Fonte simplificada: eventos de 100 Mt → ~300 m de onda local.
+    """
+    return min(
+        3000, 30 * math.log10(energy_megatons * 1e15)
+    )  # escala log simplificada
+
+
+def simulate_flood_extent(
+    lat: float, lon: float, wave_height_m: float, dem_size: int = 50
+):
+    base_elevation = float(elevation_epqs(lat, lon) or 0)
+    x = np.linspace(-dem_size // 2, dem_size // 2, dem_size)
+    y = np.linspace(-dem_size // 2, dem_size // 2, dem_size)
+    X, Y = np.meshgrid(x, y)
+    DEM = base_elevation + (Y * 0.5)
+    flood_map = DEM < (base_elevation + wave_height_m)
+    flood_indices = np.argwhere(flood_map)
+
+    # 🆕 conversão offsets -> coordenadas reais (em graus)
+    cell_size_deg = 0.002  # ~200 m por célula, ajustável
+    flooded_cells = []
+    for ix, iy in flood_indices:
+        flooded_cells.append({
+            'lat': lat + (ix - dem_size // 2) * cell_size_deg,
+            'lon': lon + (iy - dem_size // 2) * cell_size_deg,
+            'elevation_m': float(DEM[ix, iy]),
+        })
+
+    return flooded_cells
+
+
+def simulate_tsunami(lat: float, lon: float, energy_megatons: float):
+    """Wrapper geral: verifica se há risco de tsunami e simula inundação."""
+    coastal = is_near_coast(lat, lon)
+    if not coastal:
+        return {
+            'lat': lat,
+            'lon': lon,
+            'tsunami_possible': False,
+            'wave_height_m': 0,
+            'flood_extent': [],
+        }
+
+    wave_height = tsunami_wave_height(energy_megatons)
+    flooded = simulate_flood_extent(lat, lon, wave_height)
+    return {
+        'lat': lat,
+        'lon': lon,
+        'tsunami_possible': True,
+        'wave_height_m': wave_height,
+        'flood_extent_cells': flooded[:100],  # limitando por demo
+        'flood_cell_count': len(flooded),
+    }
 
 
 # =========================
@@ -284,6 +379,24 @@ class ImpactInput(BaseModel):
     lon: float
 
 
+class TsunamiRequest(BaseModel):
+    lat: float
+    lon: float
+    energy_mt: float
+
+
+class FloodedArea(BaseModel):
+    latitudes: list[list[float]]
+    longitudes: list[list[float]]
+    flooded_mask: list[list[bool]]
+
+
+class TsunamiResponse(BaseModel):
+    possible: bool
+    wave_height: float | None = None
+    flooded_area: FloodedArea | None = None
+
+
 class ImpactRouter:
     def __init__(self, container):
         self.router = APIRouter(prefix='/impact', tags=['impact'])
@@ -519,6 +632,20 @@ class ImpactRouter:
                 ),
                 'nuclear': nuclear_equivalence_Cm(
                     m_ast_kg=m_ast, asteroid_radius_m=R_ast, dv_req_mps=dv_req
-                )
+                ),
             }
             return result
+
+        @self.router.post('/simulate/tsunami')
+        def simulate_tsunami_route(data: TsunamiRequest):
+            """
+            Simula um tsunami e inundações locais com base na energia do impacto e na localização.
+            Usa dados de elevação do USGS EPQS.
+            """
+            try:
+                result = simulate_tsunami(data.lat, data.lon, data.energy_mt)
+                return result
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500, detail=f'Erro na simulação: {e}'
+                )
