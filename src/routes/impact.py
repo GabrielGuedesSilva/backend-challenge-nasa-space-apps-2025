@@ -26,6 +26,108 @@ R_EARTH = 6_371_000.0  # raio da Terra (m)
 V_ESC = 11.2  # km/s (escape da Terra na superfície)
 TNT_J = 4.184e15  # J por megaton de TNT
 
+import asyncio
+
+
+async def population_at_point_async(
+    client: httpx.AsyncClient, lat: float, lon: float
+) -> int:
+    try:
+        fr = await client.get(
+            FCC_URL,
+            params={
+                'latitude': lat,
+                'longitude': lon,
+                'format': 'json',
+                'showall': 'true',
+            },
+            headers=UA,
+            timeout=10,
+        )
+        fips_blk = fr.json().get('Block', {}).get('FIPS')
+        if not fips_blk or len(fips_blk) != 15:
+            return 0
+
+        state = fips_blk[0:2]
+        county = fips_blk[2:5]
+        tract = fips_blk[5:11]
+        block = fips_blk[11:15]
+
+        cr = await client.get(
+            CENSUS_URL,
+            params={
+                'get': 'P1_001N',
+                'for': f'block:{block}',
+                'in': f'state:{state}+county:{county}+tract:{tract}',
+            },
+            headers=UA,
+            timeout=10,
+        )
+        rows = cr.json()
+        return int(rows[1][0]) if len(rows) >= 2 else 0
+    except Exception:
+        return 0
+
+
+async def population_within_radius_async(
+    lat: float, lon: float, radius_km: float
+) -> int:
+    step_km = max(radius_km / 10, 1)
+    step_deg = step_km / 111.0
+
+    tasks = []
+    async with httpx.AsyncClient() as client:
+        for dlat in np.arange(
+            -radius_km / 111.0, radius_km / 111.0 + step_deg, step_deg
+        ):
+            for dlon in np.arange(
+                -radius_km / 111.0, radius_km / 111.0 + step_deg, step_deg
+            ):
+                if (dlat**2 + dlon**2) > (radius_km / 111.0) ** 2:
+                    continue
+                tasks.append(
+                    population_at_point_async(client, lat + dlat, lon + dlon)
+                )
+
+        pops = await asyncio.gather(*tasks)
+    return sum(pops)
+
+
+# def population_within_radius(lat: float, lon: float, radius_km: float) -> int:
+#     """
+#     Soma a população em uma área circular aproximada em torno do impacto.
+#     Usa amostragem em grade para chamar population_at_point() em múltiplos pontos.
+#     """
+#     step_km = max(
+#         radius_km / 10, 1
+#     )  # distância entre pontos de amostragem (~10 amostras por raio)
+#     step_deg = step_km / 111.0  # 1 grau ~ 111 km
+
+#     total_population = 0
+#     samples = 0
+
+#     for dlat in np.arange(
+#         -radius_km / 111.0, radius_km / 111.0 + step_deg, step_deg
+#     ):
+#         for dlon in np.arange(
+#             -radius_km / 111.0, radius_km / 111.0 + step_deg, step_deg
+#         ):
+#             # ignora pontos fora do círculo (apenas dentro do raio)
+#             if (dlat**2 + dlon**2) > (radius_km / 111.0) ** 2:
+#                 continue
+#             try:
+#                 pop = population_at_point(lat + dlat, lon + dlon)
+#                 if pop > 0:
+#                     total_population += pop
+#                 samples += 1
+#             except Exception:
+#                 continue
+
+#     # média simples (caso existam poucos blocos populacionais válidos)
+#     if samples == 0:
+#         return 0
+#     return total_population
+
 
 def elevation_epqs(lat: float, lon: float) -> float | None:
     """Obtém elevação do ponto via USGS EPQS"""
@@ -520,17 +622,12 @@ class ImpactRouter:
                 diameter_m, velocity_kms, rho_i, rho_t
             )
             crater_radius_m = (crater_km * 1000) / 2
-
-            elev_m = elevation_epqs(lat, lon)
-            pop_block = population_at_point(lat, lon)
-            bld = building_count_overpass(lat, lon, radius_m=crater_radius_m)
-
             crater_radius_km = crater_km / 2
-            pop_est = (
-                int(pop_block * (math.pi * (crater_radius_km**2) / 0.01))
-                if pop_block > 0
-                else 0
+            elev_m = elevation_epqs(lat, lon)
+            pop_est = await population_within_radius_async(
+                lat, lon, crater_radius_km
             )
+            bld = building_count_overpass(lat, lon, radius_m=crater_radius_m)
 
             crater_depth_km = calcular_profundidade_cratera(crater_km, elev_m)
 
@@ -558,16 +655,13 @@ class ImpactRouter:
             crater_radius_m = (crater_km * 1000) / 2
 
             elev_m = elevation_epqs(data.lat, data.lon)
-            pop_block = population_at_point(data.lat, data.lon)
+            # pop_block = population_at_point(data.lat, data.lon)
+            crater_radius_km = crater_km / 2
+            pop_est = await population_within_radius_async(
+                data.lat, data.lon, crater_radius_km
+            )
             bld = building_count_overpass(
                 data.lat, data.lon, radius_m=crater_radius_m
-            )
-
-            crater_radius_km = crater_km / 2
-            pop_est = (
-                int(pop_block * (math.pi * (crater_radius_km**2) / 0.01))
-                if pop_block > 0
-                else 0
             )
 
             crater_depth_km = calcular_profundidade_cratera(crater_km, elev_m)
